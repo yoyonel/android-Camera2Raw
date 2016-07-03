@@ -69,6 +69,7 @@ import android.view.ViewGroup;
 import android.widget.Toast;
 
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -308,6 +309,8 @@ public class Camera2RawFragment extends Fragment
      */
     private RefCountedAutoCloseable<ImageReader> mRawImageReader;
 
+    private RefCountedAutoCloseable<ImageReader> mYUVImageReader;
+
     /**
      * Whether or not the currently configured camera device is fixed-focus.
      */
@@ -328,6 +331,8 @@ public class Camera2RawFragment extends Fragment
      */
     private final TreeMap<Integer, ImageSaver.ImageSaverBuilder> mRawResultQueue = new TreeMap<>();
 
+    private final TreeMap<Integer, ImageSaver.ImageSaverBuilder> mYUVResultQueue = new TreeMap<>();
+
     /**
      * {@link CaptureRequest.Builder} for the camera preview
      */
@@ -345,6 +350,15 @@ public class Camera2RawFragment extends Fragment
      * taking too long.
      */
     private long mCaptureTimer;
+    private long mbeginCaptureTimer;
+
+    // Add options
+    private boolean mExportJpegImage = true;
+    private boolean mExportRawImage = false;
+    private boolean mExportYUVImage = false;
+
+    private static final int maxImages = 8;
+    private boolean mBurst = true;
 
     //**********************************************************************************************
 
@@ -425,6 +439,16 @@ public class Camera2RawFragment extends Fragment
 
     };
 
+    private final ImageReader.OnImageAvailableListener mOnYUVImageAvailableListener
+            = new ImageReader.OnImageAvailableListener() {
+
+        @Override
+        public void onImageAvailable(ImageReader reader) {
+            dequeueAndSaveImage(mYUVResultQueue, mYUVImageReader);
+        }
+
+    };
+
     /**
      * A {@link CameraCaptureSession.CaptureCallback} that handles events for the preview and
      * pre-capture sequence.
@@ -477,6 +501,10 @@ public class Camera2RawFragment extends Fragment
                             }
                             // After this, the camera will go back to the normal state of preview.
                             mState = STATE_PREVIEW;
+
+                            if ( mBurst ) {
+                                takePicture();
+                            }
                         }
                     }
                 }
@@ -503,61 +531,75 @@ public class Camera2RawFragment extends Fragment
      */
     private final CameraCaptureSession.CaptureCallback mCaptureCallback
             = new CameraCaptureSession.CaptureCallback() {
+
+        public void onCaptureStarted_gen(
+                int requestId, String currentDateTime,
+                String prefixFilename, String suffixFileName,
+                TreeMap<Integer, ImageSaver.ImageSaverBuilder> queue
+        )
+        {
+            File file = new File(Environment.
+                    getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
+                    prefixFilename + currentDateTime + suffixFileName);
+            ImageSaver.ImageSaverBuilder builder;
+            synchronized (mCameraStateLock) {
+                builder = queue.get(requestId);
+            }
+            if (builder != null) {
+                builder.setFile(file);
+                builder.setBeginCapture(mbeginCaptureTimer);
+            }
+
+        }
+
         @Override
         public void onCaptureStarted(CameraCaptureSession session, CaptureRequest request,
                                      long timestamp, long frameNumber) {
             String currentDateTime = generateTimestamp();
-            File rawFile = new File(Environment.
-                    getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
-                    "RAW_" + currentDateTime + ".dng");
-            File jpegFile = new File(Environment.
-                    getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
-                    "JPEG_" + currentDateTime + ".jpg");
-
-            // Look up the ImageSaverBuilder for this request and update it with the file name
-            // based on the capture start time.
-            ImageSaver.ImageSaverBuilder jpegBuilder;
-            ImageSaver.ImageSaverBuilder rawBuilder;
             int requestId = (int) request.getTag();
-            synchronized (mCameraStateLock) {
-                jpegBuilder = mJpegResultQueue.get(requestId);
-                rawBuilder = mRawResultQueue.get(requestId);
-            }
 
-            if (jpegBuilder != null) jpegBuilder.setFile(jpegFile);
-            if (rawBuilder != null) rawBuilder.setFile(rawFile);
+            if (mExportRawImage)
+                onCaptureStarted_gen(requestId, currentDateTime, "RAW_", ".dng", mRawResultQueue);
+            if (mExportJpegImage)
+                onCaptureStarted_gen(requestId, currentDateTime, "JPEG_", ".jpg", mJpegResultQueue);
+            if (mExportYUVImage)
+                onCaptureStarted_gen(requestId, currentDateTime, "YUV_", ".yuv", mYUVResultQueue);
+        }
+
+        public void onCaptureCompleted_gen(
+                int requestId, StringBuilder sb, TotalCaptureResult result,
+                TreeMap<Integer, ImageSaver.ImageSaverBuilder> queue
+        )
+        {
+            ImageSaver.ImageSaverBuilder builder;
+            // Look up the ImageSaverBuilder for this request and update it with the CaptureResult
+            synchronized (mCameraStateLock) {
+                builder = queue.get(requestId);
+
+                // If we have all the results necessary, save the image to a file in the background.
+                handleCompletionLocked(requestId, builder, queue);
+
+                if (builder != null) {
+                    builder.setResult(result);
+                    sb.append("Saving Image as: ");
+                    sb.append(builder.getSaveLocation());
+                }
+                finishedCaptureLocked();
+            }
         }
 
         @Override
         public void onCaptureCompleted(CameraCaptureSession session, CaptureRequest request,
                                        TotalCaptureResult result) {
             int requestId = (int) request.getTag();
-            ImageSaver.ImageSaverBuilder jpegBuilder;
-            ImageSaver.ImageSaverBuilder rawBuilder;
             StringBuilder sb = new StringBuilder();
 
-            // Look up the ImageSaverBuilder for this request and update it with the CaptureResult
-            synchronized (mCameraStateLock) {
-                jpegBuilder = mJpegResultQueue.get(requestId);
-                rawBuilder = mRawResultQueue.get(requestId);
-
-                // If we have all the results necessary, save the image to a file in the background.
-                handleCompletionLocked(requestId, jpegBuilder, mJpegResultQueue);
-                handleCompletionLocked(requestId, rawBuilder, mRawResultQueue);
-
-                if (jpegBuilder != null) {
-                    jpegBuilder.setResult(result);
-                    sb.append("Saving JPEG as: ");
-                    sb.append(jpegBuilder.getSaveLocation());
-                }
-                if (rawBuilder != null) {
-                    rawBuilder.setResult(result);
-                    if (jpegBuilder != null) sb.append(", ");
-                    sb.append("Saving RAW as: ");
-                    sb.append(rawBuilder.getSaveLocation());
-                }
-                finishedCaptureLocked();
-            }
+            if (mExportJpegImage)
+                onCaptureCompleted_gen(requestId, sb, result, mJpegResultQueue);
+            if (mExportRawImage)
+                onCaptureCompleted_gen(requestId, sb, result, mRawResultQueue);
+            if (mExportYUVImage)
+                onCaptureCompleted_gen(requestId, sb, result, mYUVResultQueue);
 
             showToast(sb.toString());
         }
@@ -567,8 +609,12 @@ public class Camera2RawFragment extends Fragment
                                     CaptureFailure failure) {
             int requestId = (int) request.getTag();
             synchronized (mCameraStateLock) {
-                mJpegResultQueue.remove(requestId);
-                mRawResultQueue.remove(requestId);
+                if (mExportJpegImage)
+                    mJpegResultQueue.remove(requestId);
+                if (mExportRawImage)
+                    mRawResultQueue.remove(requestId);
+                if (mExportYUVImage)
+                    mYUVResultQueue.remove(requestId);
                 finishedCaptureLocked();
             }
             showToast("Capture failed!");
@@ -710,34 +756,51 @@ public class Camera2RawFragment extends Fragment
                 StreamConfigurationMap map = characteristics.get(
                         CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
 
-                // For still image captures, we use the largest available size.
-                Size largestJpeg = Collections.max(
-                        Arrays.asList(map.getOutputSizes(ImageFormat.JPEG)),
-                        new CompareSizesByArea());
-
-                Size largestRaw = Collections.max(
-                        Arrays.asList(map.getOutputSizes(ImageFormat.RAW_SENSOR)),
-                        new CompareSizesByArea());
-
                 synchronized (mCameraStateLock) {
-                    // Set up ImageReaders for JPEG and RAW outputs.  Place these in a reference
-                    // counted wrapper to ensure they are only closed when all background tasks
-                    // using them are finished.
-                    if (mJpegImageReader == null || mJpegImageReader.getAndRetain() == null) {
-                        mJpegImageReader = new RefCountedAutoCloseable<>(
-                                ImageReader.newInstance(largestJpeg.getWidth(),
-                                        largestJpeg.getHeight(), ImageFormat.JPEG, /*maxImages*/5));
+                    if (mExportJpegImage) {
+                        // For still image captures, we use the largest available size.
+                        Size largestJpeg = Collections.max(
+                                Arrays.asList(map.getOutputSizes(ImageFormat.JPEG)),
+                                new CompareSizesByArea());
+                        // Set up ImageReaders for JPEG and RAW outputs.  Place these in a reference
+                        // counted wrapper to ensure they are only closed when all background tasks
+                        // using them are finished.
+                        if (mJpegImageReader == null || mJpegImageReader.getAndRetain() == null) {
+                            mJpegImageReader = new RefCountedAutoCloseable<>(
+                                    ImageReader.newInstance(largestJpeg.getWidth(),
+                                            largestJpeg.getHeight(), ImageFormat.JPEG, maxImages));
+                        }
+                        mJpegImageReader.get().setOnImageAvailableListener(
+                                mOnJpegImageAvailableListener, mBackgroundHandler);
                     }
-                    mJpegImageReader.get().setOnImageAvailableListener(
-                            mOnJpegImageAvailableListener, mBackgroundHandler);
 
-                    if (mRawImageReader == null || mRawImageReader.getAndRetain() == null) {
-                        mRawImageReader = new RefCountedAutoCloseable<>(
-                                ImageReader.newInstance(largestRaw.getWidth(),
-                                        largestRaw.getHeight(), ImageFormat.RAW_SENSOR, /*maxImages*/ 5));
+                    if (mExportRawImage) {
+                        Size largestRaw = Collections.max(
+                                Arrays.asList(map.getOutputSizes(ImageFormat.RAW_SENSOR)),
+                                new CompareSizesByArea());
+                        if (mRawImageReader == null || mRawImageReader.getAndRetain() == null) {
+                            mRawImageReader = new RefCountedAutoCloseable<>(
+                                    ImageReader.newInstance(largestRaw.getWidth(),
+                                            largestRaw.getHeight(), ImageFormat.RAW_SENSOR,
+                                            maxImages));
+                        }
+                        mRawImageReader.get().setOnImageAvailableListener(
+                                mOnRawImageAvailableListener, mBackgroundHandler);
                     }
-                    mRawImageReader.get().setOnImageAvailableListener(
-                            mOnRawImageAvailableListener, mBackgroundHandler);
+
+                    if (mExportYUVImage) {
+                        Size largestYUV = Collections.max(
+                                Arrays.asList(map.getOutputSizes(ImageFormat.YUV_420_888)),
+                                new CompareSizesByArea());
+                        if (mYUVImageReader == null || mYUVImageReader.getAndRetain() == null) {
+                            mYUVImageReader = new RefCountedAutoCloseable<>(
+                                    ImageReader.newInstance(largestYUV.getWidth(),
+                                            largestYUV.getHeight(), ImageFormat.YUV_420_888,
+                                            maxImages));
+                        }
+                        mYUVImageReader.get().setOnImageAvailableListener(
+                                mOnYUVImageAvailableListener, mBackgroundHandler);
+                    }
 
                     mCharacteristics = characteristics;
                     mCameraId = cameraId;
@@ -925,10 +988,18 @@ public class Camera2RawFragment extends Fragment
                     = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             mPreviewRequestBuilder.addTarget(surface);
 
+            List<Surface> listSurfaces = new ArrayList<>();
+            listSurfaces.add(surface);
+            if (mExportJpegImage) listSurfaces.add(mJpegImageReader.get().getSurface());
+            if (mExportRawImage) listSurfaces.add(mRawImageReader.get().getSurface());
+            if (mExportYUVImage) listSurfaces.add(mYUVImageReader.get().getSurface());
+
             // Here, we create a CameraCaptureSession for camera preview.
-            mCameraDevice.createCaptureSession(Arrays.asList(surface,
-                            mJpegImageReader.get().getSurface(),
-                            mRawImageReader.get().getSurface()), new CameraCaptureSession.StateCallback() {
+//            mCameraDevice.createCaptureSession(Arrays.asList(surface,
+//                            mJpegImageReader.get().getSurface(),
+//                            mRawImageReader.get().getSurface()), new CameraCaptureSession.StateCallback() {
+            mCameraDevice.createCaptureSession(listSurfaces,
+                    new CameraCaptureSession.StateCallback() {
                         @Override
                         public void onConfigured(CameraCaptureSession cameraCaptureSession) {
                             synchronized (mCameraStateLock) {
@@ -1158,6 +1229,9 @@ public class Camera2RawFragment extends Fragment
                 return;
             }
 
+            mbeginCaptureTimer = SystemClock.elapsedRealtime();
+            Log.i(TAG, "onClick: declenchement du shot");
+
             try {
                 // Trigger an auto-focus run if camera is capable. If the camera is already focused,
                 // this should do nothing.
@@ -1199,15 +1273,13 @@ public class Camera2RawFragment extends Fragment
     private void captureStillPictureLocked() {
         try {
             final Activity activity = getActivity();
-            if (null == activity || null == mCameraDevice) {
+            if (null == activity || null == mCameraDevice || 
+                    !(mExportJpegImage | mExportRawImage | mExportYUVImage)) {
                 return;
             }
             // This is the CaptureRequest.Builder that we use to take a picture.
             final CaptureRequest.Builder captureBuilder =
                     mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
-
-            captureBuilder.addTarget(mJpegImageReader.get().getSurface());
-            captureBuilder.addTarget(mRawImageReader.get().getSurface());
 
             // Use the same AE and AF modes as the preview.
             setup3AControlsLocked(captureBuilder);
@@ -1220,17 +1292,35 @@ public class Camera2RawFragment extends Fragment
             // Set request tag to easily track results in callbacks.
             captureBuilder.setTag(mRequestCounter.getAndIncrement());
 
+            if (mExportJpegImage)
+                captureBuilder.addTarget(mJpegImageReader.get().getSurface());
+            if (mExportRawImage)
+                captureBuilder.addTarget(mRawImageReader.get().getSurface());
+            if (mExportYUVImage)
+                captureBuilder.addTarget(mYUVImageReader.get().getSurface());
+
             CaptureRequest request = captureBuilder.build();
 
             // Create an ImageSaverBuilder in which to collect results, and add it to the queue
             // of active requests.
-            ImageSaver.ImageSaverBuilder jpegBuilder = new ImageSaver.ImageSaverBuilder(activity)
-                    .setCharacteristics(mCharacteristics);
-            ImageSaver.ImageSaverBuilder rawBuilder = new ImageSaver.ImageSaverBuilder(activity)
-                    .setCharacteristics(mCharacteristics);
 
-            mJpegResultQueue.put((int) request.getTag(), jpegBuilder);
-            mRawResultQueue.put((int) request.getTag(), rawBuilder);
+            if (mExportJpegImage) {
+                ImageSaver.ImageSaverBuilder jpegBuilder = new ImageSaver.ImageSaverBuilder(activity)
+                        .setCharacteristics(mCharacteristics);
+                mJpegResultQueue.put((int) request.getTag(), jpegBuilder);
+            }
+
+            if (mExportRawImage) {
+                ImageSaver.ImageSaverBuilder rawBuilder = new ImageSaver.ImageSaverBuilder(activity)
+                        .setCharacteristics(mCharacteristics);
+                mRawResultQueue.put((int) request.getTag(), rawBuilder);
+            }
+
+            if (mExportYUVImage) {
+                ImageSaver.ImageSaverBuilder YUVBuilder = new ImageSaver.ImageSaverBuilder(activity)
+                        .setCharacteristics(mCharacteristics);
+                mYUVResultQueue.put((int) request.getTag(), YUVBuilder);
+            }
 
             mCaptureSession.capture(request, mCaptureCallback, mBackgroundHandler);
 
@@ -1345,15 +1435,19 @@ public class Camera2RawFragment extends Fragment
          */
         private final RefCountedAutoCloseable<ImageReader> mReader;
 
+        private long mbeginCaptureTimer;
+
         private ImageSaver(Image image, File file, CaptureResult result,
                            CameraCharacteristics characteristics, Context context,
-                           RefCountedAutoCloseable<ImageReader> reader) {
+                           RefCountedAutoCloseable<ImageReader> reader,
+                           long beginTime) {
             mImage = image;
             mFile = file;
             mCaptureResult = result;
             mCharacteristics = characteristics;
             mContext = context;
             mReader = reader;
+            mbeginCaptureTimer = beginTime;
         }
 
         @Override
@@ -1375,6 +1469,9 @@ public class Camera2RawFragment extends Fragment
                     } finally {
                         mImage.close();
                         closeOutput(output);
+                        Log.i(TAG, "run: fichier ecrit et clos ->" +
+                                (SystemClock.elapsedRealtime() - mbeginCaptureTimer));
+                        mbeginCaptureTimer = SystemClock.elapsedRealtime();
                     }
                     break;
                 }
@@ -1390,6 +1487,65 @@ public class Camera2RawFragment extends Fragment
                     } finally {
                         mImage.close();
                         closeOutput(output);
+                        Log.i(TAG, "run: fichier ecrit et clos ->" +
+                                (SystemClock.elapsedRealtime() - mbeginCaptureTimer));
+                        mbeginCaptureTimer = SystemClock.elapsedRealtime();
+                    }
+                    break;
+                }
+                // YUV_420_888 images are saved in a format of our own devising. First write out the
+                // information necessary to reconstruct the image, all as ints: width, height, U-,V-plane
+                // pixel strides, and U-,V-plane row strides. (Y-plane will have pixel-stride 1 always.)
+                // Then directly place the three planes of byte data, uncompressed.
+                //
+                // Note the YUV_420_888 format does not guarantee the last pixel makes it in these planes,
+                // so some cases are necessary at the decoding end, based on the number of bytes present.
+                // An alternative would be to also encode, prior to each plane of bytes, how many bytes are
+                // in the following plane. Perhaps in the future.
+                case ImageFormat.YUV_420_888: {
+                    // "prebuffer" simply contains the meta information about the following planes.
+                    ByteBuffer prebuffer = ByteBuffer.allocate(16);
+                    prebuffer.putInt(mImage.getWidth())
+                            .putInt(mImage.getHeight())
+                            .putInt(mImage.getPlanes()[1].getPixelStride())
+                            .putInt(mImage.getPlanes()[1].getRowStride());
+
+                    FileOutputStream output = null;
+                    try {
+                        output = new FileOutputStream(mFile);
+                    } catch (FileNotFoundException e) {
+                        e.printStackTrace();
+                    }
+                    ByteBuffer buffer;
+                    byte[] bytes;
+
+                    try {
+                        output.write(prebuffer.array()); // write meta information to file
+                        // Now write the actual planes.
+                        for (int i = 0; i<3; i++){
+                            buffer = mImage.getPlanes()[i].getBuffer();
+                            bytes = new byte[buffer.remaining()]; // makes byte array large enough to hold image
+                            buffer.get(bytes); // copies image from buffer to byte array
+                            output.write(bytes);    // write the byte array to file
+                        }
+                        success = true;
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    } finally {
+                        Log.i(TAG,"Closing image to free buffer.");
+                        mImage.close(); // close this to free up buffer for other images
+                        if (null != output) {
+                            try {
+                                output.close();
+                            } catch (IOException e) {
+                                e.printStackTrace();
+                            }
+                            finally {
+                                Log.i(TAG, "run: fichier ecrit et clos ->" +
+                                        (SystemClock.elapsedRealtime() - mbeginCaptureTimer));
+                                mbeginCaptureTimer = SystemClock.elapsedRealtime();
+                            }
+                        }
                     }
                     break;
                 }
@@ -1432,6 +1588,7 @@ public class Camera2RawFragment extends Fragment
             private CameraCharacteristics mCharacteristics;
             private Context mContext;
             private RefCountedAutoCloseable<ImageReader> mReader;
+            private long mBeginCapture;
 
             /**
              * Construct a new ImageSaverBuilder using the given {@link Context}.
@@ -1481,7 +1638,7 @@ public class Camera2RawFragment extends Fragment
                     return null;
                 }
                 return new ImageSaver(mImage, mFile, mCaptureResult, mCharacteristics, mContext,
-                        mReader);
+                        mReader, mBeginCapture);
             }
 
             public synchronized String getSaveLocation() {
@@ -1491,6 +1648,11 @@ public class Camera2RawFragment extends Fragment
             private boolean isComplete() {
                 return mImage != null && mFile != null && mCaptureResult != null
                         && mCharacteristics != null;
+            }
+
+            public synchronized ImageSaverBuilder setBeginCapture(final long time) {
+                mBeginCapture = time;
+                return this;
             }
         }
     }
@@ -1768,7 +1930,8 @@ public class Camera2RawFragment extends Fragment
         ImageSaver saver = builder.buildIfComplete();
         if (saver != null) {
             queue.remove(requestId);
-            AsyncTask.THREAD_POOL_EXECUTOR.execute(saver);
+//            AsyncTask.THREAD_POOL_EXECUTOR.execute(saver);
+            saver.run();
         }
     }
 
